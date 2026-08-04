@@ -8,8 +8,7 @@ spec:
   interval: 1m0s
   url: ssh://git@github.com/jay123q/minecraft-cluster-gitops.git
   ref:
-    branch: main 
-    # so ideally we would migrate the minecraft servers into their own git repos.
+    branch: main
   secretRef:
     name: flux-system
 ---
@@ -25,7 +24,6 @@ spec:
   sourceRef:
     kind: GitRepository
     name: minecraft-gitops
-  # path: ./../../../../minecraft-cluster-gitops/cluster
   path: ./2026-minecraft-dnd-cluster
   prune: true
   wait: true
@@ -47,7 +45,6 @@ spec:
   sourceRef:
     kind: GitRepository
     name: minecraft-gitops
-  # path: ./../../../../minecraft-cluster-gitops/minecraft-cor-server/cluster
   path: ./minecraft-cor-server/cluster
   prune: true
   wait: true
@@ -56,24 +53,3 @@ spec:
     kind: Deployment
     name: minecraft-cor-server
     namespace: minecraft-cor
----
-apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: schizo-bot
-  namespace: flux-system
-spec:
-  interval: 10m
-  timeout: 5m
-  sourceRef:
-    kind: GitRepository
-    name: schizo-bot
-  # path: ./../../../../minecraft-cluster-gitops/minecraft-cor-server/cluster
-  path: ./cluster
-  prune: true
-  wait: true
-  healthChecks:
-  - apiVersion: apps/v1
-    kind: Deployment
-    name: schizo-bot
-    namespace: schizo-bot
