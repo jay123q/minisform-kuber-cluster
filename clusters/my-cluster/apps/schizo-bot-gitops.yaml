@@ -26,6 +26,10 @@ spec:
   path: ./cluster
   prune: true
   wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
   healthChecks:
   - apiVersion: apps/v1
     kind: Deployment
