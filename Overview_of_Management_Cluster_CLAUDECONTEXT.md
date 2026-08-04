@@ -267,13 +267,13 @@ To bring the minecraft servers back online, reverse these changes:
 
 ## Schizo-Bot (Discord Chatbot) — Added 2026-08-04
 
-A Discord chatbot using Ollama for LLM inference and ChromaDB for RAG-based context retrieval, deployed as a single-container pod running both ollama and the Python app.
+A Discord chatbot ("Ben") using Ollama for LLM inference, ChromaDB for RAG-based context retrieval, and persistent conversation memory. Deployed as a single-container pod running both ollama and the Python app.
 
 ### Repo
 
-- **Source:** https://github.com/jay123q/schizo-bot.git (branch: main)
+- **Source:** ssh://git@github.com/jay123q/schizo-bot.git (branch: main)
 - **GitRepository name in Flux:** `schizo-bot`
-- **Kustomization name:** `schizo-bot` (defined in `apps/minecraft-gitops.yaml`)
+- **Kustomization name:** `schizo-bot` (defined in `apps/schizo-bot-gitops.yaml`)
 - **Path from git root:** `./cluster`
 
 ### Components
@@ -281,8 +281,9 @@ A Discord chatbot using Ollama for LLM inference and ChromaDB for RAG-based cont
 | Resource | Namespace | Details |
 |----------|-----------|---------|
 | Deployment/schizo-bot | schizo-bot | 1 replica, Recreate strategy, image `jay123q/schizo-bot:latest` |
-| PVC/schizo-bot-data | schizo-bot | 20Gi (local-path) — app data, ChromaDB, txt files |
+| PVC/schizo-bot-data | schizo-bot | 20Gi (local-path) — app data, ChromaDB (knowledge + memory), txt files |
 | PVC/schizo-bot-ollama-models | schizo-bot | 15Gi (local-path) — persistent ollama model storage |
+| Secret/schizo-bot-env | schizo-bot | SOPS-encrypted Discord TOKEN, mounted via envFrom |
 | ResourceQuota | schizo-bot | 5 CPU req / 9 limit, 9Gi mem req / 13Gi limit |
 | LimitRange | schizo-bot | Container defaults: 1 CPU / 2Gi mem request |
 
@@ -291,15 +292,31 @@ A Discord chatbot using Ollama for LLM inference and ChromaDB for RAG-based cont
 1. Container entrypoint starts `ollama serve` in the background
 2. Waits for ollama readiness, then pulls `qwen3-embedding` and `qwen3` models
 3. Models are stored on the `schizo-bot-ollama-models` PVC — survives restarts (no re-download)
-4. Activates Python venv, runs `main.py` (Discord bot mode)
-5. Bot uses ChromaDB + qwen3-embedding for RAG context retrieval, qwen3 for chat generation
+4. Activates Python venv, runs `main.py` (Discord bot mode with memory enabled)
+5. On each `!m` command from Discord:
+   - Retrieves relevant knowledge chunks from `schizo_docs` collection (RAG)
+   - Retrieves the 3 most relevant past exchanges from `conversation_memory` collection
+   - Builds a prompt with both knowledge context and conversation history
+   - Generates a response via qwen3 that can reference past interactions
+   - Stores the new exchange (user name + question + response) back into memory
+
+### Conversation Memory
+
+- **Collection:** `conversation_memory` in ChromaDB (same persistent dir as knowledge base)
+- **Embedding model:** qwen3-embedding (same as knowledge base)
+- **Recall:** 3 most semantically similar past exchanges per query (configurable via `MEMORY_K`)
+- **Storage:** each exchange stored as `[username] asked: ... [Ben] replied: ...` with timestamp metadata
+- **Persistence:** survives pod restarts via `schizo-bot-data` PVC
+- **Toggle:** `--no-memory` flag disables (on by default)
+- **Effect:** Ben recognizes returning users, references past topics, builds rapport over time
 
 ### Container Details
 
-- **Base:** python:3.12-slim + ollama (installed via curl)
+- **Base:** python:3.12-slim + ollama (installed via curl) + zstd
 - **Python deps:** chromadb, ollama, discord.py, python-dotenv (installed in /app/venv)
 - **Env vars:** `TXT_DIR=/app/data/txt-files`, `CHROMA_PERSIST_DIR=/app/data/chroma_db`, `TOKEN` (Discord)
 - **Resources:** requests 2 CPU / 4Gi mem, limits 6 CPU / 8Gi mem
+- **CLI flags:** `--memory` (default on), `--no-memory`, `--reindex`, `--top-k N`, `--txt-dir PATH`
 
 ### Flux Source
 
@@ -312,9 +329,35 @@ metadata:
   namespace: flux-system
 spec:
   interval: 1m0s
-  url: https://github.com/jay123q/schizo-bot.git
+  url: ssh://git@github.com/jay123q/schizo-bot.git
   ref:
     branch: main
+  secretRef:
+    name: flux-system
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: schizo-bot
+  namespace: flux-system
+spec:
+  interval: 10m
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: schizo-bot
+  path: ./cluster
+  prune: true
+  wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  healthChecks:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: schizo-bot
+    namespace: schizo-bot
 ```
 
 ### Service IPs
@@ -330,9 +373,9 @@ None allocated — the bot connects outbound to Discord and Ollama runs in-conta
    docker push jay123q/schizo-bot:latest
    ```
 
-2. (If not done) Create SOPS-encrypted Discord token secret in `cluster/secret.yaml` and add to kustomization.yaml
+2. (If not done) Create and SOPS-encrypt Discord token in `cluster/secret.yaml`
 
-3. Commit and push both repos (schizo-bot + minisform-kuber-cluster)
+3. Commit and push the schizo-bot repo
 
 4. Flux picks up within 10 minutes, or force:
    ```bash
@@ -341,7 +384,10 @@ None allocated — the bot connects outbound to Discord and Ollama runs in-conta
 
 ### Troubleshooting
 
-- **Pod CrashLoopBackOff:** Check if ollama has enough memory to load models. qwen3-embedding is ~1.5GB, qwen3 is ~4GB. Ensure limits are sufficient.
+- **Pod CrashLoopBackOff:** Check if ollama has enough memory to load models. qwen3-embedding is ~4.7GB, qwen3 is ~5.2GB. Ensure limits are sufficient.
 - **Models re-downloading every restart:** Verify `schizo-bot-ollama-models` PVC is bound and mounted at `/root/.ollama`.
-- **Bot not responding in Discord:** Check `TOKEN` env var is set. Look at pod logs for discord.py connection errors.
+- **Bot not responding in Discord:** Check `TOKEN` env var is set via the SOPS secret. Look at pod logs for discord.py connection errors.
 - **ChromaDB errors:** May need `--reindex` if txt source files changed structure. Check `/app/data/chroma_db` mount.
+- **Memory not working:** Verify the `conversation_memory` collection exists in ChromaDB. Check pod logs for embedding errors.
+- **saveChatOutput crash:** Entrypoint creates `chat_history/` and `qwen3-save-output/` dirs. If missing, check entrypoint.sh.
+- **IndexError in saveChatOutput:** Fixed — handles LLM outputs shorter than 5 words.
