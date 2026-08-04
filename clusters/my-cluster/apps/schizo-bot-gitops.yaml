@@ -6,9 +6,11 @@ metadata:
   namespace: flux-system
 spec:
   interval: 1m0s
-  url: https://github.com/jay123q/schizo-bot.git
+  url: ssh://git@github.com/jay123q/schizo-bot.git
   ref:
     branch: main
+  secretRef:
+    name: flux-system
 ---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
