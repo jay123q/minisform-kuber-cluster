@@ -29,6 +29,7 @@ Single-node Kubernetes homelab cluster managed by **Flux CD v2.7.5**, running on
     ├── apps/
     │   ├── hello-world/               # Simple test app (Deployment + Service + ConfigMap), LoadBalancer on 192.168.1.200
     │   └── minecraft-gitops.yaml      # GitRepository + 2 Kustomizations pointing to external repo (see Sub-Clusters below)
+│   └── schizo-bot-gitops.yaml      # GitRepository for schizo-bot Discord chatbot
     ├── infrastructure/
     │   ├── cilium/                     # CNI - HelmRelease from HelmRepository (currently FAILING, see Known Issues)
     │   ├── metallb/                    # L2 load balancer - HelmRelease v0.15.3
@@ -179,6 +180,7 @@ The `agent` key in `cilium-helmrelease.yaml` values is set as an object (`agent.
 | minecraft-cor | minecraft-cor-server | Deployment | 1 replica | 20Gi PVC (local-path) | minecraft-cluster-gitops |
 | minecraft-cor | minecraft-cor-backup | CronJob | daily 3am | uses minecraft-cor PVC | minecraft-cluster-gitops |
 | rennovate | renovate | CronJob | weekly Sun midnight | none | this repo |
+| schizo-bot | schizo-bot | Deployment | 1 replica | 20Gi + 15Gi PVC (local-path) | schizo-bot repo |
 
 ---
 
@@ -260,3 +262,86 @@ To bring the minecraft servers back online, reverse these changes:
 | CronJob/minecraft-cor-backup | minecraft-cor | Suspended | No backups while server is down |
 
 **Note:** PVCs (`minecraft-data` in `minecraft` namespace, `minecraft-cor-data` in `minecraft-cor` namespace) are retained. World data is safe. Resuming will reattach to existing volumes.
+
+---
+
+## Schizo-Bot (Discord Chatbot) — Added 2026-08-04
+
+A Discord chatbot using Ollama for LLM inference and ChromaDB for RAG-based context retrieval, deployed as a single-container pod running both ollama and the Python app.
+
+### Repo
+
+- **Source:** https://github.com/jay123q/schizo-bot.git (branch: main)
+- **GitRepository name in Flux:** `schizo-bot`
+- **Kustomization name:** `schizo-bot` (defined in `apps/minecraft-gitops.yaml`)
+- **Path from git root:** `./cluster`
+
+### Components
+
+| Resource | Namespace | Details |
+|----------|-----------|---------|
+| Deployment/schizo-bot | schizo-bot | 1 replica, Recreate strategy, image `jay123q/schizo-bot:latest` |
+| PVC/schizo-bot-data | schizo-bot | 20Gi (local-path) — app data, ChromaDB, txt files |
+| PVC/schizo-bot-ollama-models | schizo-bot | 15Gi (local-path) — persistent ollama model storage |
+| ResourceQuota | schizo-bot | 5 CPU req / 9 limit, 9Gi mem req / 13Gi limit |
+| LimitRange | schizo-bot | Container defaults: 1 CPU / 2Gi mem request |
+
+### How It Works
+
+1. Container entrypoint starts `ollama serve` in the background
+2. Waits for ollama readiness, then pulls `qwen3-embedding` and `qwen3` models
+3. Models are stored on the `schizo-bot-ollama-models` PVC — survives restarts (no re-download)
+4. Activates Python venv, runs `main.py` (Discord bot mode)
+5. Bot uses ChromaDB + qwen3-embedding for RAG context retrieval, qwen3 for chat generation
+
+### Container Details
+
+- **Base:** python:3.12-slim + ollama (installed via curl)
+- **Python deps:** chromadb, ollama, discord.py, python-dotenv (installed in /app/venv)
+- **Env vars:** `TXT_DIR=/app/data/txt-files`, `CHROMA_PERSIST_DIR=/app/data/chroma_db`, `TOKEN` (Discord)
+- **Resources:** requests 2 CPU / 4Gi mem, limits 6 CPU / 8Gi mem
+
+### Flux Source
+
+Defined in `clusters/my-cluster/apps/schizo-bot-gitops.yaml`:
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: schizo-bot
+  namespace: flux-system
+spec:
+  interval: 1m0s
+  url: https://github.com/jay123q/schizo-bot.git
+  ref:
+    branch: main
+```
+
+### Service IPs
+
+None allocated — the bot connects outbound to Discord and Ollama runs in-container. No inbound Service needed.
+
+### Deployment Steps
+
+1. Build and push the image:
+   ```bash
+   cd ~/Documents/github/schizo-bot
+   docker build -t jay123q/schizo-bot:latest .
+   docker push jay123q/schizo-bot:latest
+   ```
+
+2. (If not done) Create SOPS-encrypted Discord token secret in `cluster/secret.yaml` and add to kustomization.yaml
+
+3. Commit and push both repos (schizo-bot + minisform-kuber-cluster)
+
+4. Flux picks up within 10 minutes, or force:
+   ```bash
+   flux reconcile source git schizo-bot && flux reconcile kustomization schizo-bot
+   ```
+
+### Troubleshooting
+
+- **Pod CrashLoopBackOff:** Check if ollama has enough memory to load models. qwen3-embedding is ~1.5GB, qwen3 is ~4GB. Ensure limits are sufficient.
+- **Models re-downloading every restart:** Verify `schizo-bot-ollama-models` PVC is bound and mounted at `/root/.ollama`.
+- **Bot not responding in Discord:** Check `TOKEN` env var is set. Look at pod logs for discord.py connection errors.
+- **ChromaDB errors:** May need `--reindex` if txt source files changed structure. Check `/app/data/chroma_db` mount.
