@@ -9,3 +9,4 @@ resources:
   - apps/hello-world
   - apps/minecraft-gitops.yaml
   - apps/schizo-bot-gitops.yaml
+  - apps/palworld-gitops.yaml

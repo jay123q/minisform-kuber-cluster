@@ -1,0 +1,37 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: palworld-server
+  namespace: flux-system
+spec:
+  interval: 1m0s
+  url: ssh://git@github.com/jay123q/palworld_server.git
+  ref:
+    branch: main
+  secretRef:
+    name: flux-system
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: palworld-server
+  namespace: flux-system
+spec:
+  interval: 10m
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: palworld-server
+  path: ./cluster
+  prune: true
+  wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  healthChecks:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: palworld-server
+    namespace: palworld
