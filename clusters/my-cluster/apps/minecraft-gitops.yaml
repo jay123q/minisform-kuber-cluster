@@ -6,6 +6,7 @@ metadata:
   namespace: flux-system
 spec:
   interval: 1m0s
+  suspend: true
   url: ssh://git@github.com/jay123q/minecraft-cluster-gitops.git
   ref:
     branch: main
