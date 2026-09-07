@@ -81,6 +81,7 @@ Both use the same `flux-system` SSH secret for git auth. Both have health checks
   - 192.168.1.200 — hello-world (port 80)
   - 192.168.1.201 — minecraft-server (ports 25565, 26585)
   - 192.168.1.202 — minecraft-cor-admin (port 26585)
+  - 192.168.1.203 — palworld-admin RCON (port 25575)
 - **K8s API:** 192.168.1.112:6443
 
 ---
@@ -181,6 +182,8 @@ The `agent` key in `cilium-helmrelease.yaml` values is set as an object (`agent.
 | minecraft-cor | minecraft-cor-backup | CronJob | daily 3am | uses minecraft-cor PVC | minecraft-cluster-gitops |
 | rennovate | renovate | CronJob | weekly Sun midnight | none | this repo |
 | schizo-bot | schizo-bot | Deployment | 1 replica | 20Gi + 15Gi PVC (local-path) | schizo-bot repo |
+| palworld | palworld-server | Deployment | 1 replica | 30Gi + 10Gi PVC (local-path) | palworld_server repo |
+| palworld | palworld-backup | CronJob | daily 4am | uses palworld-data PVC, hostPath backups | palworld_server repo |
 
 ---
 
@@ -391,3 +394,133 @@ None allocated — the bot connects outbound to Discord and Ollama runs in-conta
 - **Memory not working:** Verify the `conversation_memory` collection exists in ChromaDB. Check pod logs for embedding errors.
 - **saveChatOutput crash:** Entrypoint creates `chat_history/` and `qwen3-save-output/` dirs. If missing, check entrypoint.sh.
 - **IndexError in saveChatOutput:** Fixed — handles LLM outputs shorter than 5 words.
+
+---
+
+## Palworld Dedicated Server — Added 2026-08-15
+
+A Palworld dedicated game server running via SteamCMD in a custom Docker image, deployed to the cluster via Flux.
+
+### Repo
+
+- **Source:** ssh://git@github.com/jay123q/palworld_server.git (branch: main)
+- **GitRepository name in Flux:** `palworld-server`
+- **Kustomization name:** `palworld-server` (defined in `apps/palworld-gitops.yaml`)
+- **Path from git root:** `./cluster`
+
+### Components
+
+| Resource | Namespace | Details |
+|----------|-----------|---------|
+| Deployment/palworld-server | palworld | 1 replica, Recreate strategy, hostNetwork: true, image `jay123q/palworld-server:latest` |
+| PVC/palworld-data | palworld | 30Gi (local-path) — game install, save data, configs |
+| PVC/palworld-mods | palworld | 10Gi (local-path) — mod .pak files, mounted at /palworld/Pal/Content/Paks/Mods |
+| CronJob/palworld-backup | palworld | Daily 4am, 5-slot rotating backups to hostPath |
+| Service/palworld-public | palworld | NodePort — UDP 8211 (game, nodePort 30211), UDP 27015 (query, nodePort 30015) |
+| Service/palworld-admin | palworld | LoadBalancer 192.168.1.203 — TCP 25575 (RCON), restricted to 192.168.1.112/32 |
+| Secret/palworld-secrets | palworld | SOPS-encrypted, keys: server-password, admin-password |
+| ResourceQuota | palworld | 7 CPU req / 12 limit, 14Gi mem req / 20Gi limit, 3 PVCs |
+| LimitRange | palworld | Container defaults: 1 CPU / 2Gi mem request |
+
+### How It Works
+
+1. Init container (`fix-permissions`) runs `chown -R 1000:1000` on data and mods PVCs
+2. Entrypoint installs/updates Palworld via SteamCMD (app ID 2394010) to `/palworld` (on the data PVC)
+3. `PalWorldSettings.ini` is baked into the Docker image at `/home/steam/PalWorldSettings.ini` with all game settings hardcoded
+4. At startup, `envsubst` substitutes only `$ADMIN_PASSWORD` and `$SERVER_PASSWORD` from k8s secrets, writes to `/palworld/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini`
+5. Server starts on port 8211/UDP with query port 27015/UDP
+
+### Settings Management
+
+Game settings are managed via the `PalWorldSettings.ini` file in the repo root (NOT in the entrypoint). To change settings:
+1. Edit `PalWorldSettings.ini` in the `palworld_server` repo
+2. Rebuild and push the Docker image: `docker build -t jay123q/palworld-server:latest . && docker push jay123q/palworld-server:latest`
+3. Restart the pod: `kubectl rollout restart deployment/palworld-server -n palworld`
+
+Key customized settings (non-default):
+- DayTimeSpeedRate=1.25, NightTimeSpeedRate=2.0
+- ExpRate=3.0, WorkSpeedRate=5.0
+- EquipmentDurabilityDamageRate=0.1
+- PalCaptureRate=2.0, EnemyDropItemRate=5.0
+- PalStomachDecreaceRate=0.1
+- DeathPenalty=None
+- BaseCampMaxNum=128, BaseCampWorkerMaxNum=50
+- MaxBuildingLimitNum=10000
+
+Passwords (`ADMIN_PASSWORD`, `SERVER_PASSWORD`) are injected from the `palworld-secrets` k8s secret via env vars — they are NOT hardcoded in the ini file.
+
+### Networking
+
+- **hostNetwork: true** — pod uses the node's network directly (no kube-proxy)
+- **Public IP:** 99.76.176.199 (AT&T WAN IPv4)
+- **Router port forwarding required:** UDP 8211 (game) and UDP 27015 (query) → fedora-2 (192.168.1.112)
+- **RCON:** TCP 25575 via MetalLB LoadBalancer on 192.168.1.203, restricted to local node only
+
+### Backup System
+
+- **Schedule:** Daily at 4am via CronJob
+- **Retention:** 5 rotating slots — uses `day-of-year % 5` to cycle through `palworld-backup-slot-{1..5}.tar.gz`
+- **Source:** `/palworld/Pal/Saved` (read-only mount of palworld-data PVC)
+- **Destination:** `/home/jclapp/palworld-backups` on the host (hostPath mount)
+- **Resources:** 100m CPU / 256Mi mem request, 500m CPU / 512Mi limit
+
+### Flux Source
+
+Defined in `clusters/my-cluster/apps/palworld-gitops.yaml`:
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: palworld-server
+  namespace: flux-system
+spec:
+  interval: 1m0s
+  url: ssh://git@github.com/jay123q/palworld_server.git
+  ref:
+    branch: main
+  secretRef:
+    name: flux-system
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: palworld-server
+  namespace: flux-system
+spec:
+  interval: 10m
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: palworld-server
+  path: ./cluster
+  prune: true
+  wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  healthChecks:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: palworld-server
+    namespace: palworld
+```
+
+### Known Issues & Lessons Learned
+
+1. **ResourceQuota must have headroom for backup jobs.** The server uses 6 CPU / 12Gi memory requests. The quota must allow extra for the backup CronJob (100m CPU / 256Mi) to run concurrently. Original quota of exactly 6 CPU / 12Gi caused every backup job to fail with `exceeded quota`.
+
+2. **PVC deletion + Flux reconciliation.** If a PVC is manually deleted, Flux will recreate it on next reconciliation (PVCs are in the kustomization). However, the health check may time out (5m) if the Deployment can't start without the PVC. Force reconcile with: `flux reconcile source git palworld-server && flux reconcile kustomization palworld-server`
+
+3. **Docker image rebuild required for settings changes.** Since `PalWorldSettings.ini` is baked into the image (not generated at runtime), any game settings change requires an image rebuild and push.
+
+4. **SteamCMD validate runs every start.** The entrypoint runs `+app_update validate` on every container start, which re-downloads/verifies game files. First start after a fresh PVC takes ~10-15 minutes.
+
+### Troubleshooting
+
+- **Pod Pending after PVC deletion:** Force Flux reconcile to recreate PVCs, or manually `kubectl apply -f cluster/pvc.yaml`
+- **Backup jobs failing:** Check ResourceQuota — `kubectl get resourcequota -n palworld` — requests must have headroom above server usage
+- **Players can't connect:** Verify AT&T router NAT/Gaming has both UDP 8211 AND UDP 27015 forwarded to fedora-2. Check public IP hasn't changed: `curl -4 ifconfig.me`
+- **Settings not applied:** Image rebuild needed — `PalWorldSettings.ini` is baked in at build time. Check the file in the repo, not the entrypoint
+- **CrashLoopBackOff:** Usually SteamCMD failing during install. Check logs: `kubectl logs -n palworld deploy/palworld-server --tail=100`
+- **Container exits immediately:** Likely missing game files on a fresh PVC. Wait for SteamCMD to finish downloading (~8GB)
