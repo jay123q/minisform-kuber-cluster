@@ -5,7 +5,7 @@ metadata:
   name: palworld-server
   namespace: flux-system
 spec:
-  suspend: true
+  suspend: false
   interval: 1m0s
   url: ssh://git@github.com/jay123q/palworld_server.git
   ref:
@@ -19,7 +19,7 @@ metadata:
   name: palworld-server
   namespace: flux-system
 spec:
-  suspend: true
+  suspend: false
   interval: 10m
   timeout: 5m
   sourceRef:
